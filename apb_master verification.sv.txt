@@ -1,0 +1,464 @@
+//====================================================
+// File: design.sv
+// Description: APB Slave RTL Design
+//====================================================
+`include "apb_if.sv"
+`include "apb_master.sv" // ADD THIS LINE to resolve the module definition
+
+module design_top (
+    apb_if.master cif, 
+    input  logic [31:0] i_addr, i_wdata,
+    input  logic        i_write, i_setup,
+    output logic [31:0] o_rdata,
+    output logic        o_ready
+);
+
+  // The compiler now knows what 'apb_master' is because of the include above
+  apb_master dut (
+    .pclk(cif.pclk),
+    .presetn(cif.presetn),
+    .i_addr(i_addr),
+    .i_wdata(i_wdata),
+    .i_write(i_write),
+    .i_setup(i_setup),
+    .o_rdata(o_rdata),
+    .o_ready(o_ready),
+    .paddr(cif.paddr),
+    .pwdata(cif.pwdata),
+    .pwrite(cif.pwrite),
+    .psel(cif.psel),
+    .penable(cif.penable),
+    .prdata(cif.prdata),
+    .pready(cif.pready)
+  );
+
+endmodule
+
+//====================================================
+// File: apb_master.sv
+// Description: APB Interface
+//====================================================
+`ifndef APB_MASTER_SV
+`define APB_MASTER_SV
+
+module apb_master (
+    input  logic        pclk,
+    input  logic        presetn,
+    
+    // Sideband signals to trigger a transaction
+    input  logic [31:0] i_addr,
+    input  logic [31:0] i_wdata,
+    input  logic        i_write,
+    input  logic        i_setup,   // Set high to start a transfer
+    output logic [31:0] o_rdata,
+    output logic        o_ready,   // High when transfer is complete
+
+    // APB Bus Signals (to be connected to apb_if)
+    output logic [31:0] paddr,
+    output logic [31:0] pwdata,
+    output logic        pwrite,
+    output logic        psel,
+    output logic        penable,
+    input  logic [31:0] prdata,
+    input  logic        pready
+);
+
+  // State Machine Definition
+  typedef enum logic [1:0] {IDLE = 2'b00, SETUP = 2'b01, ACCESS = 2'b10} state_t;
+  state_t state;
+
+  always_ff @(posedge pclk or negedge presetn) begin
+    if (!presetn) begin
+      state   <= IDLE;
+      psel    <= 0;
+      penable <= 0;
+      o_ready <= 0;
+      paddr   <= 0;
+      pwdata  <= 0;
+      pwrite  <= 0;
+    end else begin
+      case (state)
+        IDLE: begin
+          o_ready <= 0;
+          if (i_setup) begin
+            state  <= SETUP;
+            psel   <= 1;
+            paddr  <= i_addr;
+            pwrite <= i_write;
+            pwdata <= i_wdata;
+          end
+        end
+
+        SETUP: begin
+          state   <= ACCESS;
+          penable <= 1; // Move to Access phase
+        end
+
+        ACCESS: begin
+          if (pready) begin // Wait for Slave (UVM Driver) to be ready
+            if (!pwrite) o_rdata <= prdata; // Capture data if Read
+            psel    <= 0;
+            penable <= 0;
+            o_ready <= 1;   // Pulse ready to internal logic
+            state   <= IDLE;
+          end
+        end
+        
+        default: state <= IDLE;
+      endcase
+    end
+  end
+
+endmodule
+
+`endif // APB_MASTER_SV
+
+
+//====================================================
+// File: apb_if.sv
+// Description: UVM Package with all components
+//====================================================
+`ifndef APB_IF_SV
+`define APB_IF_SV
+
+interface apb_if(input logic pclk, input logic presetn);
+  logic [31:0] paddr, pwdata, prdata;
+  logic        pwrite, psel, penable, pready;
+
+  modport master (
+    input  pclk, presetn, prdata, pready,
+    output paddr, pwdata, pwrite, psel, penable
+  );
+
+  modport MST_MON (
+    input pclk, presetn, paddr, pwdata, pwrite, psel, penable, prdata, pready
+  );
+
+  clocking slv_cb @(posedge pclk);
+    default input #1ns output #1ns;
+    input  paddr, pwdata, pwrite, psel, penable;
+    output prdata, pready;
+  endclocking
+endinterface
+
+`endif
+
+
+//====================================================
+// File: testbench.sv
+// Description: Top-level UVM Testbench
+//====================================================
+`include "apb_pkg.sv"
+
+module top;
+  import uvm_pkg::*;
+  import apb_pkg::*;
+
+  bit pclk, presetn;
+  logic [31:0] i_addr, i_wdata, o_rdata;
+  logic i_write, i_setup, o_ready;
+
+  always #5 pclk = ~pclk;
+  apb_if cif(pclk, presetn);
+
+  // Connect the DUT
+  design_top dut_wrapper ( .cif(cif), .* );
+
+  initial begin
+    // Hardware Reset and Trigger
+    presetn = 0; i_setup = 0;
+    #25 presetn = 1;
+    
+    @(posedge pclk);
+    i_addr = 32'hABCD; i_wdata = 32'h1234; i_write = 1; i_setup = 1;
+    @(posedge pclk);
+    i_setup = 0;
+    
+    // CRITICAL: Wait for the handshake to finish before ending
+    wait(o_ready == 1);
+    #50; 
+    $display("Transaction Completed Successfully at %t", $time);
+    $finish;
+  end
+
+  initial begin
+    uvm_config_db#(virtual apb_if)::set(null, "*", "vif", cif);
+    run_test("base_test");
+  end
+
+  initial begin $dumpfile("dump.vcd"); $dumpvars; end
+endmodule
+
+//====================================================
+// File: mst_monitor.sv
+//====================================================
+class mst_monitor extends uvm_monitor;
+  `uvm_component_utils(mst_monitor)
+
+  virtual apb_if vif; // The virtual interface pointer
+  uvm_analysis_port #(apb_trans) item_collected_port;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    item_collected_port = new("item_collected_port", this);
+  endfunction
+
+  // --- ADD THIS SECTION START ---
+  virtual function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    // Retrieve the interface from the database
+    if(!uvm_config_db#(virtual apb_if)::get(this, "", "vif", vif)) begin
+       `uvm_fatal("MON_VIF_ERR", "Monitor could not get virtual interface 'vif'")
+    end
+  endfunction
+  // --- ADD THIS SECTION END ---
+
+  task run_phase(uvm_phase phase);
+    apb_trans trans;
+    forever begin
+      @(posedge vif.pclk); // This line (16) was crashing because vif was null
+      if (vif.psel && vif.penable && vif.pready) begin
+        trans = apb_trans::type_id::create("trans");
+        trans.addr  = vif.paddr;
+        trans.write = vif.pwrite;
+        if (trans.write) trans.data = vif.pwdata;
+        else             trans.data = vif.prdata;
+        item_collected_port.write(trans);
+      end
+    end
+  endtask
+endclass
+
+//====================================================
+// File: slv_driver.sv
+//====================================================
+class slv_driver extends uvm_driver #(apb_trans);
+  `uvm_component_utils(slv_driver)
+  virtual apb_if vif;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if(!uvm_config_db#(virtual apb_if)::get(this, "", "vif", vif))
+      `uvm_fatal("DRV", "Could not get virtual interface")
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    forever begin
+      // Synchronize with the clocking block
+      @(vif.slv_cb);
+      
+      // LOGIC: If Master is in Access Phase, Slave must drive PREADY
+      if (vif.slv_cb.psel && vif.slv_cb.penable) begin
+        vif.slv_cb.pready <= 1; // Handshake: Tell Master we are ready
+        
+        // If it's a Read, provide some dummy data
+        if (!vif.slv_cb.pwrite)
+          vif.slv_cb.prdata <= 32'hABCD_5088; 
+          
+      end else begin
+        // Otherwise, keep ready low
+        vif.slv_cb.pready <= 0;
+      end
+    end
+  endtask
+endclass
+
+//====================================================
+// File: apb_trans.sv
+//====================================================
+class apb_trans extends uvm_sequence_item;
+  // Transaction fields
+  rand bit [31:0] addr;
+  rand bit [31:0] data;
+  rand bit        write; // 1 for Write, 0 for Read
+  
+  // Response fields (populated by the Slave Driver)
+  bit [31:0] rdata;
+  bit        error;
+
+  // UVM Automation Macros
+  `uvm_object_utils_begin(apb_trans)
+    `uvm_field_int(addr,  UVM_ALL_ON)
+    `uvm_field_int(data,  UVM_ALL_ON)
+    `uvm_field_int(write, UVM_ALL_ON)
+    `uvm_field_int(rdata, UVM_ALL_ON)
+    `uvm_field_int(error, UVM_ALL_ON)
+  `uvm_object_utils_end
+
+  function new(string name = "apb_trans");
+    super.new(name);
+  endfunction
+endclass
+
+//====================================================
+// File: env.sv
+//====================================================
+class env extends uvm_env;
+  `uvm_component_utils(env)
+  slv_driver    drv;
+  mst_monitor   mon;
+  apb_sequencer seqr;
+  scoreboard    scb;
+
+  function new(string name, uvm_component parent); super.new(name, parent); endfunction
+
+  function void build_phase(uvm_phase phase);
+    drv  = slv_driver::type_id::create("drv", this);
+    mon  = mst_monitor::type_id::create("mon", this);
+    seqr = apb_sequencer::type_id::create("seqr", this);
+    scb  = scoreboard::type_id::create("scb", this);
+  endfunction
+
+  function void connect_phase(uvm_phase phase);
+    drv.seq_item_port.connect(seqr.seq_item_export);
+    mon.item_collected_port.connect(scb.item_collected_export);
+  endfunction
+endclass
+//====================================================
+// File: scoreboard.sv
+//====================================================
+class scoreboard extends uvm_scoreboard;
+  `uvm_component_utils(scoreboard)
+  uvm_analysis_imp #(apb_trans, scoreboard) item_collected_export;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    item_collected_export = new("item_collected_export", this);
+  endfunction
+
+  // This function is called every time the monitor sends a transaction
+  virtual function void write(apb_trans trans);
+    `uvm_info("SCB", $sformatf("Observed: Addr=%h, Data=%h, Write=%b", trans.addr, trans.data, trans.write), UVM_LOW)
+    // Add protocol check logic here
+  endfunction
+endclass
+//====================================================
+// File: test.sv
+//====================================================
+class base_test extends uvm_test;
+  `uvm_component_utils(base_test)
+  env e_0;
+
+  function new(string name = "base_test", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    e_0 = env::type_id::create("e_0", this);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    phase.raise_objection(this);
+    `uvm_info("TEST", "Starting APB Master Verification Test", UVM_LOW)
+    #500; // Wait for the initial logic in top module to finish transactions
+    phase.drop_objection(this);
+  endtask
+endclass
+//====================================================
+// File: apb_pkg.sv
+//====================================================
+package apb_pkg;
+  import uvm_pkg::*;
+  `include "uvm_macros.svh"
+
+  // Include the interface definition here so all classes can see it
+  `include "apb_if.sv" 
+
+  `include "apb_trans.sv"
+  `include "gen.sv"
+  `include "slv_driver.sv"
+  `include "mst_monitor.sv"
+  `include "scoreboard.sv"
+  `include "env.sv"
+  `include "test.sv"
+endpackage
+//====================================================
+// File: gen.sv
+//====================================================
+class apb_sequencer extends uvm_sequencer #(apb_trans);
+  `uvm_component_utils(apb_sequencer)
+
+  function new(string name = "apb_sequencer", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+endclass
+//====================================================
+// File: apb_agent.sv
+//====================================================
+class apb_agent extends uvm_agent;
+  `uvm_component_utils(apb_agent)
+
+  // 1. Declare the components
+  apb_sequencer sqr;
+  slv_driver    drv;
+  mst_monitor   mon;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  // 2. Build Phase: Instantiate the components
+  virtual function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    
+    // Always build the monitor
+    mon = mst_monitor::type_id::create("mon", this);
+
+    // Only build Driver and Sequencer if the Agent is ACTIVE
+    if(get_is_active() == UVM_ACTIVE) begin
+      sqr = apb_sequencer::type_id::create("sqr", this);
+      drv = slv_driver::type_id::create("drv", this);
+    end
+  endfunction
+
+  // 3. Connect Phase: The actual "wiring"
+  virtual function void connect_phase(uvm_phase phase);
+    super.connect_phase(phase);
+    
+    if(get_is_active() == UVM_ACTIVE) begin
+      // Connect Driver's TLM port to Sequencer's TLM export
+      drv.seq_item_port.connect(sqr.seq_item_export);
+    end
+  endfunction
+
+endclass
+//====================================================
+// File: apb_sequence.sv
+//====================================================
+class apb_base_sequence extends uvm_sequence #(apb_trans);
+  `uvm_object_utils(apb_base_sequence)
+
+  // Constructor
+  function new(string name = "apb_base_sequence");
+    super.new(name);
+  endfunction
+
+  // The body task is where the actual logic happens
+  virtual task body();
+    // Create the transaction object
+    req = apb_trans::type_id::create("req");
+
+    // 1. Start the item (Handshake with Sequencer)
+    start_item(req);
+
+    // 2. Randomize or Set specific values
+    // Here we set a specific Write transaction to test the Master
+    if (!req.randomize() with { 
+        addr  == 32'hA000; 
+        data  == 32'h1234; 
+        write == 1'b1; 
+    }) begin
+      `uvm_error("SEQ", "Randomization failed!")
+    end
+
+    // 3. Finish the item (Send it to the Driver)
+    finish_item(req);
+    
+    `uvm_info("SEQ", $sformatf("Sequence generated: Addr=%h, Data=%h", req.addr, req.data), UVM_LOW)
+  endtask
+endclass
